@@ -1,7 +1,7 @@
 --[[
 文档_ https://github.com/hooke007/mpv_PlayKit/discussions/624
 
-使用 MediaInfo 解析当前文件信息（不含外部或追加合并的轨道）并输出至OSD
+使用 MediaInfo 解析当前文件信息（不含外部或追加合并的轨道）并输出至OSD/uosc menu
 ]]
 
 local mp = require "mp"
@@ -29,6 +29,7 @@ local user_opt = {
 	indent_size = 2,
 	max_lines = 22,
 	extraspaces = 24,
+	max_words = 40,
 }
 
 mp.options.read_options(user_opt)
@@ -82,6 +83,9 @@ local clipboard_cache = {}
 local current_path = nil
 local is_loading = false
 local is_fresh_load = true
+
+local update_umenu
+local umenu_visible = false
 
 local function detect_platform()
 	local platform = mp.get_property_native("platform")
@@ -595,6 +599,9 @@ local function on_file_loaded()
 	if visible or pp then
 		load_mediainfo()
 	end
+	if umenu_visible then
+		update_umenu()
+	end
 end
 
 local function on_file_end()
@@ -620,3 +627,181 @@ mp.add_key_binding(nil, "refresh", function()
 	mp.osd_message("MediaInfo: Reloading ...", 1)
 	force_refresh()
 end)
+
+-- ============================= uosc 扩展菜单集成 =============================
+
+local uosc_available = false
+mp.register_script_message("uosc-version", function(version)
+	uosc_available = true
+end)
+
+local umenu_type = "stats_mediainfo"
+
+-- 按 UTF-8 字符计数截断长hint
+local function truncate_hint(str)
+	local max = user_opt.max_words
+	if max <= 0 or not str then return str end
+	local count = 0
+	local byte_pos = 1
+	local len = #str
+	while byte_pos <= len do
+		count = count + 1
+		if count > max then
+			return str:sub(1, byte_pos - 1) .. "..."
+		end
+		local b = str:byte(byte_pos)
+		if b < 0x80 then
+			byte_pos = byte_pos + 1
+		elseif b < 0xE0 then
+			byte_pos = byte_pos + 2
+		elseif b < 0xF0 then
+			byte_pos = byte_pos + 3
+		else
+			byte_pos = byte_pos + 4
+		end
+	end
+	return str
+end
+
+local function build_umenu_items(data)
+	local items = {
+		{
+			title = "复制所有内容到剪贴板",
+			icon = "content_copy",
+			value = "copy_all",
+			bold = true,
+			separator = true,
+		},
+	}
+
+	if type(data) ~= "table" then
+		return items
+	end
+
+	-- 处理 MediaInfo JSON 顶层结构: { media: { track: [...] } }
+	if data.media and data.media.track then
+		local tracks = data.media.track
+		local type_count = {}
+		for _, track in ipairs(tracks) do
+			if type(track) == "table" and track["@type"] then
+				local track_type = track["@type"]
+				type_count[track_type] = (type_count[track_type] or 0) + 1
+				local track_title = track_type .. " #" .. type_count[track_type]
+				local sub_items = {}
+
+				local sorted_keys = {}
+				for k, _ in pairs(track) do
+					if k ~= "@type" then
+						table.insert(sorted_keys, k)
+					end
+				end
+				table.sort(sorted_keys)
+
+				for _, k in ipairs(sorted_keys) do
+					local v = track[k]
+					if type(v) == "table" then
+						-- 嵌套 table 展开为子菜单
+						local nested_items = {}
+						local nested_keys = {}
+						for nk, _ in pairs(v) do
+							table.insert(nested_keys, nk)
+						end
+						table.sort(nested_keys)
+						for _, nk in ipairs(nested_keys) do
+							local nv = v[nk]
+							local val_str = type(nv) == "boolean" and (nv and "Yes" or "No") or tostring(nv)
+							nested_items[#nested_items + 1] = {
+								title = tostring(nk),
+								hint = truncate_hint(val_str),
+								value = val_str,
+							}
+						end
+						sub_items[#sub_items + 1] = {
+							title = k,
+							hint = tostring(#nested_items) .. " items",
+							items = nested_items,
+						}
+					else
+						local val_str = type(v) == "boolean" and (v and "Yes" or "No") or tostring(v)
+						sub_items[#sub_items + 1] = {
+							title = k,
+							hint = truncate_hint(val_str),
+							value = val_str,
+						}
+					end
+				end
+
+				items[#items + 1] = {
+					title = track_title,
+					hint = tostring(#sub_items) .. " items",
+					items = sub_items,
+				}
+			end
+		end
+	end
+
+	if #items == 0 then
+		items[#items + 1] = {
+			title = "No media information",
+			selectable = false,
+			muted = true,
+			icon = "info",
+		}
+	end
+
+	return items
+end
+
+local function build_umenu_data(info)
+	return {
+		type = umenu_type,
+		title = "MediaInfo",
+		keep_open = true,
+		callback = {mp.get_script_name(), "umenu-event"},
+		items = build_umenu_items(info),
+		search_submenus = true,
+	}
+end
+
+update_umenu = function()
+	if not uosc_available then return end
+	get_mediainfo_async(function(info, err)
+		if not info then return end
+		local json = mp.utils.format_json(build_umenu_data(info))
+		mp.commandv("script-message-to", "uosc", "update-menu", json)
+	end)
+end
+
+local function open_umenu()
+	if not uosc_available then
+		msg.warn("uosc is not available")
+		mp.osd_message("uosc is not available", 2)
+		return
+	end
+	get_mediainfo_async(function(info, err)
+		if not info then
+			mp.osd_message("MediaInfo: " .. (err or "No data"), 2)
+			return
+		end
+		local json = mp.utils.format_json(build_umenu_data(info))
+		mp.commandv("script-message-to", "uosc", "open-menu", json, "")
+		umenu_visible = true
+	end)
+end
+
+mp.register_script_message("umenu-event", function(json)
+	local event = mp.utils.parse_json(json)
+	if not event then return end
+	if event.type == "activate" and event.value then
+		if event.value == "copy_all" then
+			copy2clipboard()
+		else
+			mp.set_property("clipboard/text", tostring(event.value))
+			mp.osd_message("Copied: " .. tostring(event.value), 2)
+		end
+	elseif event.type == "close" then
+		umenu_visible = false
+	end
+end)
+
+mp.register_script_message("uosc-menu-mediainfo", open_umenu)
